@@ -1,12 +1,11 @@
-import requests
-from bs4 import BeautifulSoup
-import datetime
+import time
 import json
 import os
-import time
-from fake_useragent import UserAgent
-from tqdm import tqdm
+import datetime
 import logging
+from bs4 import BeautifulSoup
+from tqdm import tqdm
+from curl_cffi import requests
 
 # Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s', handlers=[
@@ -16,17 +15,67 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 class NewsScraper:
     def __init__(self):
-        self.ua = UserAgent()
         self.output_dir = "scraped_data"
-        # We will use simple file reading/writing per article batch (or day)
-        # to handle the organized structure: Year/Month/source.json
         if not os.path.exists(self.output_dir):
             os.makedirs(self.output_dir)
 
+        # Initialize session
+        self.session = requests.Session(impersonate="chrome")
+        self.manual_cookies_set = False
+
     def get_headers(self):
-        return {
-            'User-Agent': self.ua.random
-        }
+        # We rely on curl_cffi impersonate, but can add others if needed
+        # Return empty dict as headers are managed by session
+        return {}
+
+    def make_request(self, url, retries=3):
+        try:
+            # We don't use self.get_headers() here because session maintains headers
+            # However, if we needed to add specific headers per request, we could.
+            response = self.session.get(url, timeout=30)
+
+            if response.status_code == 403 and "thehindu.com" in url:
+                logging.warning("Got 403 Forbidden. Cloudflare protection active.")
+
+                # Check if we should prompt user
+                if not self.manual_cookies_set:
+                     print("\n" + "!"*50)
+                     print("CLOUDFLARE BLOCK DETECTED")
+                     print("The script cannot bypass the Cloudflare protection automatically.")
+                     print("Please open the URL in your browser: ", url)
+                     print("Then copy the 'Cookie' header from your browser's developer tools (Network tab).")
+                     print("!"*50 + "\n")
+
+                     cookie_input = input("Enter Cookie string (or press Enter to skip/abort): ").strip()
+                     ua_input = input("Enter User-Agent string (optional, press Enter to use default): ").strip()
+
+                     if cookie_input:
+                         # Update session headers
+                         self.session.headers["Cookie"] = cookie_input
+                         if ua_input:
+                             self.session.headers["User-Agent"] = ua_input
+
+                         self.manual_cookies_set = True
+                         logging.info("Updated session with manual cookies. Retrying...")
+                         return self.make_request(url, retries=retries-1)
+                     else:
+                         logging.error("No cookies provided. Skipping this URL.")
+                         return None
+                elif retries > 0:
+                     # If cookies are already set but we still get 403, maybe wait and retry?
+                     # Or maybe cookies expired.
+                     logging.warning(f"403 Forbidden with manual cookies. Retrying {retries} more times...")
+                     time.sleep(2)
+                     return self.make_request(url, retries=retries-1)
+                else:
+                    logging.error("403 Forbidden even with manual cookies. They might be expired or invalid.")
+                    return None
+
+            return response
+
+        except Exception as e:
+            logging.error(f"Request failed for {url}: {e}")
+            return None
 
     def save_article(self, article):
         date_obj = datetime.datetime.strptime(article['date'], '%Y-%m-%d')
@@ -58,7 +107,6 @@ class NewsScraper:
         try:
             with open(filename, 'w', encoding='utf-8') as f:
                 json.dump(data, f, ensure_ascii=False, indent=4)
-            # logging.info(f"Saved article to {filename}") # Too verbose
         except Exception as e:
             logging.error(f"Failed to save article to {filename}: {e}")
 
@@ -76,8 +124,8 @@ class NewsScraper:
             while current_url:
                 logging.info(f"Scraping Indian Express Archive: {current_url}")
                 try:
-                    response = requests.get(current_url, headers=self.get_headers(), timeout=15)
-                    if response.status_code == 200:
+                    response = self.make_request(current_url)
+                    if response and response.status_code == 200:
                         soup = BeautifulSoup(response.content, 'html.parser')
 
                         links = soup.find_all('a')
@@ -115,7 +163,7 @@ class NewsScraper:
                         else:
                             current_url = None
                     else:
-                        logging.warning(f"Failed to fetch archive page {current_url}: {response.status_code}")
+                        logging.warning(f"Failed to fetch archive page {current_url} or blocked")
                         current_url = None
                 except Exception as e:
                     logging.error(f"Error scraping {current_url}: {e}")
@@ -123,8 +171,8 @@ class NewsScraper:
 
     def fetch_indian_express_content(self, url):
         try:
-            response = requests.get(url, headers=self.get_headers(), timeout=10)
-            if response.status_code == 200:
+            response = self.make_request(url)
+            if response and response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
 
                 # Try standard content containers
@@ -141,7 +189,7 @@ class NewsScraper:
                 else:
                     return None
             else:
-                logging.warning(f"Failed to fetch article {url}: {response.status_code}")
+                logging.warning(f"Failed to fetch article {url}")
                 return None
         except Exception as e:
             logging.error(f"Error fetching content from {url}: {e}")
@@ -154,9 +202,9 @@ class NewsScraper:
             logging.info(f"Scraping The Hindu Archive: {url}")
 
             try:
-                response = requests.get(url, headers=self.get_headers(), timeout=15)
+                response = self.make_request(url)
 
-                if response.status_code == 200:
+                if response and response.status_code == 200:
                     soup = BeautifulSoup(response.content, 'html.parser')
 
                     links = soup.find_all('a')
@@ -182,18 +230,19 @@ class NewsScraper:
                             }
                             self.save_article(article_data)
                         time.sleep(1)
-                elif response.status_code == 403:
-                    logging.error(f"Access Forbidden (403) for {url}. Cloudflare protection likely active.")
+                elif response and response.status_code == 403:
+                    logging.error(f"Access Forbidden (403) for {url}. Cloudflare protection active/failed bypass.")
                 else:
-                     logging.warning(f"Failed to fetch archive page {url}: {response.status_code}")
+                    code = response.status_code if response else "Unknown"
+                    logging.warning(f"Failed to fetch archive page {url}: {code}")
 
             except Exception as e:
                 logging.error(f"Error scraping {url}: {e}")
 
     def fetch_the_hindu_content(self, url):
         try:
-            response = requests.get(url, headers=self.get_headers(), timeout=10)
-            if response.status_code == 200:
+            response = self.make_request(url)
+            if response and response.status_code == 200:
                 soup = BeautifulSoup(response.content, 'html.parser')
 
                 content_div = None
@@ -211,7 +260,8 @@ class NewsScraper:
                     return text_content
                 return None
             else:
-                logging.warning(f"Failed to fetch article {url}: {response.status_code}")
+                code = response.status_code if response else "Unknown"
+                logging.warning(f"Failed to fetch article {url}: {code}")
                 return None
         except Exception as e:
             logging.error(f"Error fetching content from {url}: {e}")
